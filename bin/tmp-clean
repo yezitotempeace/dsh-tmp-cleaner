@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""tmp-clean — 容器 /tmp 临时目录清理工具（容量阈值 + 周期间隔 自动触发）。
+
+设计要点
+--------
+* 只清理 /tmp 的**顶层目录**，默认不动任何顶层文件、隐藏条目与符号链接；
+* 只清理 "年龄" ≥ min_age_hours 且**没有被任何进程占用**的目录；
+* 两种自动触发：/tmp 超过 max_size_gb 时清到 target_size_gb 以下；
+  距上次清理超过 interval_hours 时做一次例行清理（清掉所有符合条件的目录）；
+* watch 常驻守护进程按 poll_minutes 轮询触发条件，由 web 插件在启动时拉起。
+
+文件位置
+--------
+配置  /root/.tmp-clean/config.json
+状态  /root/.tmp-clean/state.json
+日志  /root/.tmp-clean/tmp-clean.log
+PID   /root/.tmp-clean/watch.pid
+
+常用命令
+--------
+  tmp-clean status [--json]                    查看状态（含 /tmp 当前大小、上次/下次清理）
+  tmp-clean run [--dry-run] [--force]          立即清理（--dry-run 只演示；--force 忽略年龄限制）
+  tmp-clean tick [--dry-run]                   按触发条件判断，必要时清理（watch 内部使用）
+  tmp-clean watch [--poll-minutes N]           常驻守护（自动拉起，一般不需手动运行）
+  tmp-clean enable | disable                   开 / 关 自动清理
+  tmp-clean config list | get [k] | set k=v…   查看 / 修改配置
+  tmp-clean log [--tail N]                     查看日志
+"""
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import shutil
+import signal
+import stat as statmod
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+ROOT = "/tmp"
+STATE_DIR = "/root/.tmp-clean"
+CONFIG_PATH = os.path.join(STATE_DIR, "config.json")
+STATE_PATH = os.path.join(STATE_DIR, "state.json")
+LOG_PATH = os.path.join(STATE_DIR, "tmp-clean.log")
+PID_PATH = os.path.join(STATE_DIR, "watch.pid")
+
+DEFAULTS = {
+    "enabled": True,
+    "interval_hours": 24,      # <=0 关闭“按周期”触发
+    "max_size_gb": 20,         # <=0 关闭“按容量”触发
+    "target_size_gb": 10,      # 容量触发的清理目标（清到该值以下）
+    "min_age_hours": 2,        # 只清 mtime 早于该时长的目录
+    "dirs_only": True,         # True=只删目录，顶层文件一律不动
+    "keep_hidden": True,       # 保留 . 开头的条目
+    "keep_globs": ["bili-proxy*"],   # 额外保留名单（fnmatch 模式）
+    "poll_minutes": 15,        # watch 轮询间隔（分钟）
+    "dry_run": False,          # True=永不真正删除（全局演练开关）
+}
+
+GB = 1024 * 1024  # KB -> GB
+
+
+# ---------------------------------------------------------------- 基础工具
+
+def now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def human(kb: float) -> str:
+    if kb >= GB:
+        return f"{kb / GB:.2f} GiB"
+    if kb >= 1024:
+        return f"{kb / 1024:.1f} MiB"
+    return f"{kb:.0f} KiB"
+
+
+def ensure_state_dir() -> None:
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+
+
+def _load_json(path: str, fallback):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return fallback
+
+
+def _save_json(path: str, value) -> None:
+    ensure_state_dir()
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(value, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def load_config() -> dict:
+    cfg = dict(DEFAULTS)
+    cfg.update(_load_json(CONFIG_PATH, {}) or {})
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    _save_json(CONFIG_PATH, cfg)
+
+
+def load_state() -> dict:
+    return _load_json(STATE_PATH, {}) or {}
+
+
+def save_state(state: dict) -> None:
+    _save_json(STATE_PATH, state)
+
+
+def log(event: str, message: str) -> None:
+    ensure_state_dir()
+    line = f"{now_iso()} [{event}] {message}\n"
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- 磁盘占用
+
+def du_kb(*paths: str) -> dict:
+    """用 du -xsk 计算路径占用（KB）；失败时回退到 Python 遍历。"""
+    result: dict = {}
+    try:
+        proc = subprocess.run(
+            ["du", "-xsk", *paths],
+            capture_output=True, text=True, timeout=900,
+        )
+        for line in proc.stdout.splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) == 2:
+                try:
+                    result[parts[1].strip()] = int(parts[0])
+                except ValueError:
+                    pass
+    except (OSError, subprocess.SubprocessError):
+        pass
+    for path in paths:
+        if path not in result:
+            result[path] = _walk_kb(path)
+    return result
+
+
+def _walk_kb(path: str) -> int:
+    total = 0
+    try:
+        st = os.lstat(path)
+        total += st.st_blocks * 512
+        if statmod.S_ISDIR(st.st_mode):
+            with os.scandir(path) as it:
+                for entry in it:
+                    total += _walk_kb(entry.path)
+    except OSError:
+        pass
+    return total // 1024
+
+
+def tmp_size_kb() -> int:
+    return du_kb(ROOT).get(ROOT, 0)
+
+
+# ---------------------------------------------------------------- 选择候选
+
+def _open_paths() -> set:
+    """收集当前所有进程打开的路径（fd / cwd / root），用于占用保护。"""
+    used = set()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        base = f"/proc/{pid}"
+        for kind in ("fd", "cwd", "root"):
+            if kind == "fd":
+                try:
+                    for fd in os.listdir(os.path.join(base, "fd")):
+                        try:
+                            used.add(os.readlink(os.path.join(base, "fd", fd)))
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
+            else:
+                try:
+                    used.add(os.readlink(os.path.join(base, kind)))
+                except OSError:
+                    pass
+    return {p.removesuffix(" (deleted)") for p in used if p.startswith("/")}
+
+
+def _mount_points() -> set:
+    mounts = set()
+    try:
+        with open("/proc/self/mountinfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                fields = line.split()
+                if len(fields) > 4:
+                    mounts.add(fields[4])
+    except OSError:
+        pass
+    return mounts
+
+
+def _in_use(path: str, used: set) -> bool:
+    prefix = path.rstrip("/") + "/"
+    for item in used:
+        if item == path or item.startswith(prefix):
+            return True
+    return False
+
+
+def collect_candidates(cfg: dict, min_age_hours: float | None = None):
+    """返回 (候选列表, 被跳过的列表)。候选 = 顶层目录中安全可删的。"""
+    age_h = cfg["min_age_hours"] if min_age_hours is None else min_age_hours
+    used = _open_paths()
+    mounts = _mount_points()
+    keep_globs = list(cfg.get("keep_globs") or [])
+    now = time.time()
+
+    candidates, skipped = [], []
+    try:
+        names = sorted(os.listdir(ROOT))
+    except OSError as exc:
+        return [], [("(无法列目录)", str(exc))]
+
+    for name in names:
+        path = os.path.join(ROOT, name)
+        if cfg.get("keep_hidden", True) and name.startswith("."):
+            skipped.append((path, "隐藏条目"))
+            continue
+        if any(fnmatch.fnmatch(name, pat) for pat in keep_globs):
+            skipped.append((path, "保留名单"))
+            continue
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if statmod.S_ISLNK(st.st_mode):
+            skipped.append((path, "符号链接"))
+            continue
+        if not statmod.S_ISDIR(st.st_mode):
+            if cfg.get("dirs_only", True):
+                skipped.append((path, "顶层文件（默认不动）"))
+                continue
+        if age_h and (now - st.st_mtime) < age_h * 3600:
+            skipped.append((path, f"太新（< {age_h:g}h）"))
+            continue
+        if path in mounts:
+            skipped.append((path, "挂载点"))
+            continue
+        if _in_use(path, used):
+            skipped.append((path, "正被进程使用"))
+            continue
+        candidates.append({"name": name, "path": path, "mtime": st.st_mtime})
+    candidates.sort(key=lambda item: item["mtime"])  # 最老的优先
+    return candidates, skipped
+
+
+def delete_entries(entries, dry_run: bool) -> int:
+    freed = 0
+    for item in entries:
+        path = item["path"]
+        size = item.get("size_kb", 0)
+        if dry_run:
+            log("DRYRUN", f"将删除 {path}（{human(size)}）")
+            freed += size
+            continue
+        try:
+            shutil.rmtree(path)
+            freed += size
+            log("DELETE", f"{path}（{human(size)}）")
+        except OSError as exc:
+            log("ERROR", f"删除失败 {path}: {exc}")
+    return freed
+
+
+# ---------------------------------------------------------------- 清理动作
+
+def run_cleanup(cfg: dict, reason: str, *, force: bool = False,
+                dry_run: bool = False, size_target: bool = False) -> dict:
+    """执行一次清理。size_target=True 时只清到 target_size_gb 以下。"""
+    result = {"reason": reason, "freed_kb": 0, "deleted": 0, "dry_run": dry_run}
+    min_age = None if force else cfg["min_age_hours"]
+    candidates, skipped = collect_candidates(cfg, min_age_hours=min_age)
+    if not candidates:
+        info = f"无符合条件的目录（跳过 {len(skipped)} 项）"
+        log("SKIP", f"reason={reason} {info}")
+        return result
+
+    sizes = du_kb(*[c["path"] for c in candidates])
+    for item in candidates:
+        item["size_kb"] = sizes.get(item["path"], 0)
+
+    if size_target:
+        target_kb = max(0.0, cfg["target_size_gb"]) * GB
+        current = tmp_size_kb()
+        chosen, planned = [], 0
+        for item in candidates:
+            if current - planned <= target_kb:
+                break
+            chosen.append(item)
+            planned += item["size_kb"]
+        if not chosen and candidates:
+            chosen = [candidates[0]]  # 至少清一个，避免完全卡死
+    else:
+        chosen = candidates
+
+    freed = delete_entries(chosen, dry_run)
+    result["freed_kb"] = freed
+    result["deleted"] = len(chosen)
+    result["skipped"] = len(skipped)
+    log("RUN", f"reason={reason}{' dry-run' if dry_run else ''} "
+               f"删除 {len(chosen)} 个目录，释放 {human(freed)}")
+
+    if not dry_run:
+        state = load_state()
+        state.update({
+            "last_run_iso": now_iso(),
+            "last_run_ts": time.time(),
+            "last_reason": reason,
+            "last_freed_kb": freed,
+            "last_deleted": [c["path"] for c in chosen],
+            "total_freed_kb": int(state.get("total_freed_kb", 0)) + freed,
+        })
+        save_state(state)
+    return result
+
+
+def due_reason(cfg: dict, state: dict) -> str | None:
+    """判断当前是否该清理：'size' / 'interval' / None。"""
+    size_kb = tmp_size_kb()
+    if cfg["max_size_gb"] > 0 and size_kb > cfg["max_size_gb"] * GB:
+        return "size"
+    if cfg["interval_hours"] > 0:
+        last = state.get("last_run_ts") or 0
+        if time.time() - last >= cfg["interval_hours"] * 3600:
+            return "interval"
+    return None
+
+
+def tick(cfg: dict, dry_run: bool = False) -> dict:
+    state = load_state()
+    state["last_check_iso"] = now_iso()
+    state["last_check_ts"] = time.time()
+    if not cfg.get("enabled", True):
+        state["last_reason"] = "disabled"
+        save_state(state)
+        return {"reason": "disabled", "freed_kb": 0}
+    reason = due_reason(cfg, state)
+    if not reason:
+        save_state(state)
+        return {"reason": "noop", "freed_kb": 0}
+    return run_cleanup(cfg, reason, dry_run=dry_run, size_target=(reason == "size"))
+
+
+# ---------------------------------------------------------------- 子命令
+
+def cmd_status(args) -> int:
+    cfg = load_config()
+    state = load_state()
+    import shutil as _sh
+    pid = None
+    try:
+        pid = int(open(PID_PATH, encoding="utf-8").read().strip())
+    except (OSError, ValueError):
+        pid = None
+    watcher_alive = bool(pid) and _pid_alive(pid)
+    size_kb = None if args.fast else tmp_size_kb()
+    last_run = state.get("last_run_ts") or 0
+    next_due = None
+    if cfg["interval_hours"] > 0 and last_run:
+        next_due = last_run + cfg["interval_hours"] * 3600
+
+    info = {
+        "enabled": cfg["enabled"],
+        "interval_hours": cfg["interval_hours"],
+        "max_size_gb": cfg["max_size_gb"],
+        "target_size_gb": cfg["target_size_gb"],
+        "min_age_hours": cfg["min_age_hours"],
+        "poll_minutes": cfg["poll_minutes"],
+        "dry_run": cfg["dry_run"],
+        "tmp_size_kb": size_kb,
+        "tmp_size_human": human(size_kb) if size_kb is not None else None,
+        "watcher_pid": pid if watcher_alive else None,
+        "watcher_alive": watcher_alive,
+        "last_run_iso": state.get("last_run_iso"),
+        "last_reason": state.get("last_reason"),
+        "last_freed_human": human(state.get("last_freed_kb", 0)) if state.get("last_freed_kb") else None,
+        "total_freed_human": human(state.get("total_freed_kb", 0)) if state.get("total_freed_kb") else None,
+        "next_interval_due_iso": (datetime.fromtimestamp(next_due).astimezone().isoformat(timespec="seconds")
+                                  if next_due else None),
+        "config_path": CONFIG_PATH,
+        "log_path": LOG_PATH,
+    }
+    if args.json:
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+        return 0
+    print("== tmp-clean 状态 ==")
+    print(f"自动清理      : {'开启' if cfg['enabled'] else '关闭'}")
+    print(f"容量触发      : > {cfg['max_size_gb']:g} GiB 时清到 {cfg['target_size_gb']:g} GiB 以下"
+          if cfg["max_size_gb"] > 0 else "容量触发      : 关闭")
+    print(f"周期触发      : 每 {cfg['interval_hours']:g} 小时" if cfg["interval_hours"] > 0
+          else "周期触发      : 关闭")
+    print(f"目录年龄限制  : {cfg['min_age_hours']:g} 小时")
+    print(f"当前 /tmp     : {info['tmp_size_human'] if info['tmp_size_human'] else '(用 --fast 跳过)'}")
+    print(f"守护进程      : {'运行中 PID ' + str(pid) if watcher_alive else '未运行'}"
+          f"（轮询 {cfg['poll_minutes']:g} 分钟）")
+    print(f"上次清理      : {info['last_run_iso'] or '（还没清理过）'}"
+          + (f"（{info['last_reason']}，释放 {info['last_freed_human']}）" if info['last_reason'] else ""))
+    print(f"下次周期清理  : {info['next_interval_due_iso'] or '（未启用）'}")
+    print(f"累计释放      : {info['total_freed_human'] or '0'}")
+    print(f"配置文件      : {CONFIG_PATH}")
+    return 0
+
+
+def cmd_run(args) -> int:
+    cfg = load_config()
+    dry = args.dry_run or cfg.get("dry_run", False)
+    res = run_cleanup(cfg, "manual", force=args.force, dry_run=dry)
+    print(f"[{'演练' if dry else '完成'}] 删除 {res['deleted']} 个目录，"
+          f"释放 {human(res['freed_kb'])}")
+    return 0
+
+
+def cmd_tick(args) -> int:
+    cfg = load_config()
+    dry = args.dry_run or cfg.get("dry_run", False)
+    res = tick(cfg, dry_run=dry)
+    print(json.dumps(res, ensure_ascii=False))
+    return 0
+
+
+def cmd_watch(args) -> int:
+    ensure_state_dir()
+    cfg = load_config()
+    if args.poll_minutes:
+        cfg["poll_minutes"] = args.poll_minutes
+    if os.path.exists(PID_PATH):
+        try:
+            old = int(open(PID_PATH, encoding="utf-8").read().strip())
+        except (OSError, ValueError):
+            old = None
+        if old and old != os.getpid() and _pid_alive(old):
+            print(f"watch 已在运行（pid {old}），退出。")
+            return 3
+    with open(PID_PATH, "w", encoding="utf-8") as fh:
+        fh.write(str(os.getpid()))
+    log("WATCH", f"watch 启动 pid={os.getpid()} 轮询={cfg['poll_minutes']:g}min")
+
+    stopping = {"flag": False}
+
+    def _stop(signum, frame):
+        stopping["flag"] = True
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stopping["flag"]:
+        cfg = load_config()
+        if args.poll_minutes:
+            cfg["poll_minutes"] = args.poll_minutes
+        try:
+            tick(cfg)
+        except Exception as exc:  # noqa: BLE001 —— 守护进程绝不能因此退出
+            log("ERROR", f"tick 异常: {exc!r}")
+        for _ in range(max(1, int(cfg["poll_minutes"] * 60))):
+            if stopping["flag"]:
+                break
+            time.sleep(1)
+    try:
+        os.unlink(PID_PATH)
+    except OSError:
+        pass
+    log("WATCH", "watch 退出")
+    return 0
+
+
+def cmd_enable(args) -> int:
+    cfg = load_config()
+    cfg["enabled"] = bool(args.value)
+    save_config(cfg)
+    print("自动清理已" + ("开启" if cfg["enabled"] else "关闭"))
+    return 0
+
+
+# --------------------------------------------------- config 子命令
+
+def _parse_size_gb(text: str) -> float:
+    t = text.strip().lower()
+    for suffix, factor in (("gib", 1), ("gb", 1), ("g", 1), ("mib", 1 / 1024), ("mb", 1 / 1024), ("m", 1 / 1024)):
+        if t.endswith(suffix):
+            return float(t[: -len(suffix)]) * factor
+    return float(t)
+
+
+def _parse_hours(text: str) -> float:
+    t = text.strip().lower()
+    if t in ("off", "none", "never", "0", "-"):
+        return 0
+    for suffix, factor in (("hours", 1), ("hour", 1), ("h", 1), ("days", 24), ("day", 24), ("d", 24),
+                           ("minutes", 1 / 60), ("min", 1 / 60), ("m", 1 / 60)):
+        if t.endswith(suffix):
+            return float(t[: -len(suffix)]) * factor
+    return float(t)
+
+
+CONFIG_ALIASES = {
+    "interval": "interval_hours", "interval-hours": "interval_hours",
+    "max": "max_size_gb", "max-size": "max_size_gb", "max_size": "max_size_gb",
+    "target": "target_size_gb", "target-size": "target_size_gb", "target_size": "target_size_gb",
+    "min-age": "min_age_hours", "min_age": "min_age_hours", "age": "min_age_hours",
+    "poll": "poll_minutes", "poll-minutes": "poll_minutes",
+    "dry-run": "dry_run", "dry_run": "dry_run",
+    "enabled": "enabled",
+}
+
+BOOL_KEYS = {"enabled", "dry_run", "dirs_only", "keep_hidden"}
+HOUR_KEYS = {"interval_hours", "min_age_hours"}
+SIZE_KEYS = {"max_size_gb", "target_size_gb"}
+
+
+def _apply_setting(cfg: dict, key: str, value: str) -> None:
+    key = CONFIG_ALIASES.get(key, key.replace("-", "_"))
+    if key not in DEFAULTS:
+        raise SystemExit(f"未知配置项：{key}")
+    if key in BOOL_KEYS:
+        cfg[key] = value.strip().lower() in ("1", "true", "yes", "on", "开")
+    elif key in HOUR_KEYS:
+        cfg[key] = _parse_hours(value)
+    elif key in SIZE_KEYS:
+        cfg[key] = _parse_size_gb(value)
+    elif key == "poll_minutes":
+        cfg[key] = float(value)
+    elif key == "keep_globs":
+        cfg[key] = [v.strip() for v in value.split(",") if v.strip()]
+    else:
+        cfg[key] = value
+
+
+def cmd_config(args) -> int:
+    cfg = load_config()
+    if args.action == "list" or args.action is None:
+        for key in DEFAULTS:
+            print(f"{key:16s} = {json.dumps(cfg.get(key), ensure_ascii=False)}")
+        return 0
+    if args.action == "get":
+        keys = args.values or list(DEFAULTS)
+        for key in keys:
+            k = CONFIG_ALIASES.get(key, key)
+            print(f"{k} = {json.dumps(cfg.get(k), ensure_ascii=False)}")
+        return 0
+    if args.action == "set":
+        if not args.values:
+            raise SystemExit("用法：tmp-clean config set key=value [key=value ...]")
+        for pair in args.values:
+            if "=" not in pair:
+                raise SystemExit(f"参数应为 key=value：{pair}")
+            key, value = pair.split("=", 1)
+            _apply_setting(cfg, key, value)
+        save_config(cfg)
+        print("已保存：")
+        cmd_config(argparse.Namespace(action="list", values=[]))
+        return 0
+    raise SystemExit("用法：tmp-clean config list|get [key]|set key=value ...")
+
+
+def cmd_log(args) -> int:
+    try:
+        with open(LOG_PATH, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        lines = []
+    for line in lines[-args.tail:]:
+        sys.stdout.write(line)
+    return 0
+
+
+# ---------------------------------------------------------------- 入口
+
+def _pid_alive(pid: int) -> bool:
+    """PID 存活且确实属于 tmp-clean。
+
+    Android/Linux 会复用 PID：只看 os.kill(pid, 0) 会把别的进程误认成守护进程，
+    结果是 watch 拒绝启动（"已在运行"）而实际早已掉线。这里额外核对 cmdline。
+    """
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            return b"tmp-clean" in fh.read()
+    except OSError:
+        return True  # /proc 不可读时退回旧语义，不误杀
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="tmp-clean",
+        description="容器 /tmp 临时目录清理工具（容量阈值 + 周期间隔 自动触发）",
+    )
+    parser.add_argument("--version", action="version", version="tmp-clean 1.0")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_status = sub.add_parser("status", help="查看状态")
+    p_status.add_argument("--json", action="store_true")
+    p_status.add_argument("--fast", action="store_true", help="跳过 /tmp 大小扫描")
+    p_status.set_defaults(func=cmd_status)
+
+    p_run = sub.add_parser("run", help="立即清理一次")
+    p_run.add_argument("--dry-run", action="store_true")
+    p_run.add_argument("--force", action="store_true", help="忽略年龄限制")
+    p_run.set_defaults(func=cmd_run)
+
+    p_tick = sub.add_parser("tick", help="按触发条件判断并（必要时）清理")
+    p_tick.add_argument("--dry-run", action="store_true")
+    p_tick.set_defaults(func=cmd_tick)
+
+    p_watch = sub.add_parser("watch", help="常驻守护进程")
+    p_watch.add_argument("--poll-minutes", type=float, default=None)
+    p_watch.set_defaults(func=cmd_watch)
+
+    p_enable = sub.add_parser("enable", help="开启自动清理")
+    p_enable.set_defaults(func=cmd_enable, value=True)
+    p_disable = sub.add_parser("disable", help="关闭自动清理")
+    p_disable.set_defaults(func=cmd_enable, value=False)
+
+    p_conf = sub.add_parser("config", help="查看/修改配置")
+    p_conf.add_argument("action", nargs="?", choices=["list", "get", "set"], default="list")
+    p_conf.add_argument("values", nargs="*")
+    p_conf.set_defaults(func=cmd_config)
+
+    p_log = sub.add_parser("log", help="查看日志")
+    p_log.add_argument("--tail", type=int, default=30)
+    p_log.set_defaults(func=cmd_log)
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

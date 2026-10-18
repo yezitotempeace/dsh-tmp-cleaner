@@ -1,0 +1,5 @@
+# dsh-tmp-cleaner bundle patch: one host-only plugin row.
+# Host half: ensures the /tmp cleaner watcher is running on boot.
+- insert:
+    - id: tmp-cleaner
+      name: dsh-tmp-cleaner
