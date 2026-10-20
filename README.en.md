@@ -18,8 +18,9 @@ A DSH plugin that keeps the `/tmp` cleanup daemon alive and adds a **Temp cleanu
 | `cordis.patch.yml` | Plugin row declaration (`dsh.bundle`) |
 | `test/*.mjs` | Offline tests (fake ctx / fake loader) |
 
-The tool is called from `/root/dsh-bin/tmp-clean` (the `TOOL` constant in `lib/index.js`);
-if you install it elsewhere, change that constant or copy/link `bin/tmp-clean` there.
+The tool defaults to the bundled `bin/tmp-clean`, resolved from `import.meta.url` so no `/root` absolute path is required.
+Lookup order: `TMP_CLEAN_TOOL` env var → bundled `bin/tmp-clean` → legacy `/root/dsh-bin/tmp-clean`.
+It runs through `python3` (override with `TMP_CLEAN_PYTHON`), so the script does not need the executable bit.
 
 ## Host half (lib/index.js)
 
@@ -72,5 +73,6 @@ node test/probe-web.mjs     # probe a running web server (needs a valid local co
 
 - Install: put the repo at `/root/dsh-tmp-cleaner`, add `"dsh-tmp-cleaner": "link:/root/dsh-tmp-cleaner"`
   to the profile `dependencies` and `dsh-tmp-cleaner` to `dsh.profile.bundles`, create the
-  `node_modules/dsh-tmp-cleaner` link, place `bin/tmp-clean` at `/root/dsh-bin/`, then **restart the web app once**.
+  `node_modules/dsh-tmp-cleaner` link, then **restart the web app once**.
+The cleaner ships inside the package (`bin/tmp-clean`, Python 3, zero third-party deps); no copy to `/root/dsh-bin/` is needed.
 - Uninstall: undo the above and `kill $(cat /root/.tmp-clean/watch.pid)`.
