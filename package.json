@@ -1,6 +1,6 @@
 {
   "name": "dsh-tmp-cleaner",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "description": "启动时确保 /tmp 清理守护进程运行（含进程内看门狗与兜底清理），并提供设置页与 /tmp-clean/api 接口",
   "type": "module",
