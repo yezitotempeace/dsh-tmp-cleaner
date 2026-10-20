@@ -19,8 +19,9 @@ DSH 插件：保证 `/tmp` 清理守护进程一直活着，并在「设置」�
 | `cordis.patch.yml` | 插件行声明（`dsh.bundle`） |
 | `test/*.mjs` | 离线测试（假 ctx / 假 loader） |
 
-工具默认从 `/root/dsh-bin/tmp-clean` 调用（`lib/index.js` 的 `TOOL` 常量）；
-装到别处时改这个常量，或把 `bin/tmp-clean` 复制/链接到该路径。
+工具默认直接用随包自带的 `bin/tmp-clean`（通过 `import.meta.url` 定位，不依赖 `/root` 绝对路径）；
+查找顺序：`TMP_CLEAN_TOOL` 环境变量 → 包内 `bin/tmp-clean` → 旧的 `/root/dsh-bin/tmp-clean`。
+执行时用 `python3`（可用 `TMP_CLEAN_PYTHON` 覆盖），所以不需要脚本有可执行位。
 
 ## 宿主半边（lib/index.js）
 
@@ -76,5 +77,6 @@ node test/probe-web.mjs     # 对运行中的 web 探测（需有效本地 cooki
 
 - 安装：把仓库放进 `/root/dsh-tmp-cleaner`，在 profile 的 `dependencies` 加
   `"dsh-tmp-cleaner": "link:/root/dsh-tmp-cleaner"`、`dsh.profile.bundles` 加 `dsh-tmp-cleaner`，
-  建 `node_modules/dsh-tmp-cleaner` 链接，把 `bin/tmp-clean` 放到 `/root/dsh-bin/`，**重启一次 web**。
+  建 `node_modules/dsh-tmp-cleaner` 链接，**重启一次 web**。
+工具已随包提供（`bin/tmp-clean`，Python 3，零第三方依赖），不需要另外复制到 `/root/dsh-bin/`。
 - 卸载：反做上述步骤，并 `kill $(cat /root/.tmp-clean/watch.pid)`。
